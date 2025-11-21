@@ -1,6 +1,8 @@
 ## 使用说明
 
-### 写在开头
+### 写在开头~配环境啦
+pip install -r requirements.txt
+
 使用cuda的同学请ctrl+F检索替换npu为cuda并删去import torch_npu
 
 多卡训练通信的"hccl"换为"nccl"
