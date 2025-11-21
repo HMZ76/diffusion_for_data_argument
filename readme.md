@@ -1,5 +1,10 @@
 ## 使用说明
 
+### 写在开头
+使用cuda的同学请ctrl+F检索替换npu为cuda并删去import torch_npu
+
+多卡训练通信的"hccl"换为"nccl"
+
 ### 下载数据集 
 ```
 wget https://sven-mayer.com/datasets/2022-MobileHCI-SuperRes/16h5_training.pkl
@@ -42,4 +47,6 @@ python score_matching.py
 python score_matching.py --sample --model_path ./checkpoints_ddpm_score/best_model.pt
 ```
 
-### eval
+### eval(似乎有问题)
+
+
