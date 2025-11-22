@@ -1,9 +1,12 @@
 ## 使用说明
 
 ### 配环境
+```
 conda create -n tpdf python=3.10
 
 pip install -r requirements.txt
+
+```
 
 因为我是用npu训练的
 
