@@ -44,15 +44,39 @@ cd classifer_free_guidance
 python -m torch.distributed.launch --nproc_per_node=8 multi_cfg_train.py
 
 ```
+
+## 采样
+```
+python sample.py \
+  --model_path ./checkpoints/multiscale_model_epoch_2.pt \
+  --num_samples 100 \
+  --cfg_scale 2.5 \
+  --sample_steps 60 \
+  --output_root ./results \
+  --batch_size 64
+
+```
+
 ### dps训练
 ```
 cd dps
 #训练
-python score_matching.py
-#dps采样
-python score_matching.py --sample --model_path ./checkpoints_ddpm_score/best_model.pt
+python score_matching_train.py
+
+#采样
+python sample.py \
+  --model_path ./checkpoints_ddpm_score/best_model.pt \
+  --num_samples 20 \
+  --cond_data_root ../generated_data/ \
+  --output_dir ./results \
+  --device npu
 ```
 
-### eval(似乎有问题)
+### eval(FID似乎有问题)
+```
+python eval.py --gen_folder 生成图片文件夹 --target_folder 目标文件夹
 
+#LPIPS: 0.1196 ± 0.0236
+#FID: 104.7085
+```
 

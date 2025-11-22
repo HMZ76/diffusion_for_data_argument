@@ -1,131 +1,175 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+import torchvision.transforms as transforms
 from PIL import Image
-from pytorch_fid import fid_score
+from tqdm import tqdm
+import argparse
 from lpips import LPIPS
-from cfg_mult_npu import MultiScaleDataset, MultiScaleUNet, SimpleDiffusion
+from pytorch_fid.fid_score import calculate_fid_given_paths
 import torch_npu
-import tqdm
-from datetime import datetime
 
-# ---------------------- 配置参数 ----------------------
-TEST_DATA_ROOT = "./generated_data"
-CHECKPOINT_PATH = "./checkpoints/multiscale_model_epoch_4.pt"
-SAVE_DIR = "./conditional_fid_results"
-GENERATED_ROOT = os.path.join(SAVE_DIR, "generated")  # 全局保存生成图像
-TARGET_ROOT = os.path.join(SAVE_DIR, "target")        # 全局保存真实图像
-TARGET_SIZE = 32
-TEMPLATE_SIZE = 128
-BATCH_SIZE = 1000  # 建议根据设备内存调整
-DIFFUSION_STEPS = 50
-DEVICE = 'npu' if torch.npu.is_available() else 'cpu'
-MAX_SAMPLES = 20000  # 仅使用前2000个样本
+# ===================== 配置与工具函数 =====================
+def set_seed(seed=42):
+    """设置随机种子确保结果可复现"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.npu.is_available():
+        torch.npu.manual_seed_all(seed)
 
+set_seed()
 
-def save_images(images, save_root, batch_idx):
-    """直接保存图像到根目录（不分组）"""
-    os.makedirs(save_root, exist_ok=True)
-    for i, img in enumerate(images):
-        img_np = img.squeeze().cpu().detach().numpy()
-        # 归一化到[0,255]并转为uint8
-        img_np = ((img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8) * 255).astype(np.uint8)
-        Image.fromarray(img_np).save(os.path.join(save_root, f"batch_{batch_idx}_img_{i}.png"))
+def get_image_paths(folder, sort=True):
+    """获取文件夹内所有PNG图像路径，按序号排序"""
+    image_paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.png')]
+    if sort:
+        # 按文件名中的数字序号排序（支持1.png、0001.png等格式）
+        def extract_num(filename):
+            name = os.path.splitext(os.path.basename(filename))[0]
+            return int(name) if name.isdigit() else 999999
+        image_paths.sort(key=extract_num)
+    return image_paths
 
+def load_image_tensor(path, size=None, device='npu'):
+    """加载图像并转为模型输入格式的tensor"""
+    transform = transforms.Compose([
+        transforms.Resize(size) if size else transforms.Lambda(lambda x: x),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # [-1,1] 归一化（LPIPS要求）
+    ])
+    image = Image.open(path).convert('RGB')  # 转为RGB（即使是灰度图也转为3通道）
+    tensor = transform(image).unsqueeze(0).to(device)  # (1,3,H,W)
+    return tensor
+
+def load_image_for_fid(path, size=(299, 299), device='npu'):
+    """加载图像用于FID计算（Inception v3要求输入299x299）"""
+    transform = transforms.Compose([
+        transforms.Resize(size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet归一化
+    ])
+    image = Image.open(path).convert('RGB')
+    tensor = transform(image).unsqueeze(0).to(device)  # (1,3,299,299)
+    return tensor
+
+# ===================== 核心评估函数 =====================
+def calculate_lpips(gen_paths, target_paths, device='npu'):
+    """
+    计算LPIPS（感知相似度）
+    LPIPS值越小，感知相似度越高（理想值≈0，最大值≈1）
+    """
+    # 初始化LPIPS模型（使用预训练的vgg网络）
+    lpips_model = LPIPS(net='vgg', verbose=False).to(device)
+    lpips_model.eval()
+    
+    lpips_scores = []
+    print(f"\n=== 计算LPIPS（感知相似度）===")
+    with torch.no_grad():
+        for gen_path, target_path in tqdm(zip(gen_paths, target_paths), total=len(gen_paths)):
+            # 加载图像（保持原始尺寸一致）
+            gen_tensor = load_image_tensor(gen_path, device=device)
+            target_tensor = load_image_tensor(target_path, device=device)
+            
+            # 计算单张图像的LPIPS
+            score = lpips_model(gen_tensor, target_tensor).item()
+            lpips_scores.append(score)
+    
+    # 统计结果
+    mean_lpips = np.mean(lpips_scores)
+    std_lpips = np.std(lpips_scores)
+    print(f"LPIPS - 平均值: {mean_lpips:.4f}, 标准差: {std_lpips:.4f}")
+    return mean_lpips, std_lpips, lpips_scores
+
+def calculate_fid(gen_folder, target_folder, device='npu', batch_size=32):
+    """
+    计算FID（Fréchet Inception Distance）
+    FID值越小，生成分布与真实分布越接近（理想值≈0，一般<100为优秀）
+    """
+    print(f"\n=== 计算FID（分布相似度）===")
+    # 确保文件夹路径正确
+    gen_folder = os.path.abspath(gen_folder)
+    target_folder = os.path.abspath(target_folder)
+    
+    # 使用pytorch-fid库计算FID（自动处理图像加载和特征提取）
+    fid_value = calculate_fid_given_paths(
+        paths=[gen_folder, target_folder],
+        batch_size=batch_size,
+        device=device,
+        dims=2048,  # Inception v3的2048维特征
+        num_workers=4
+    )
+    
+    print(f"FID值: {fid_value:.4f}")
+    return fid_value
+
+# ===================== 主函数 =====================
+def main():
+    parser = argparse.ArgumentParser(description="计算生成结果与目标的LPIPS和FID指标")
+    parser.add_argument("--gen_folder", type=str, required=True, help="生成结果文件夹（含1.png、2.png...）")
+    parser.add_argument("--target_folder", type=str, required=True, help="目标图像文件夹（含1.png、2.png...）")
+    parser.add_argument("--device", type=str, default='npu', help="设备（npu/cpu，建议使用GPU）")
+    parser.add_argument("--batch_size", type=int, default=32, help="FID计算的batch_size（根据GPU内存调整）")
+    parser.add_argument("--save_scores", action='store_true', help="是否保存每张图像的LPIPS分数到txt文件")
+    
+    args = parser.parse_args()
+    
+    # 检查设备
+    if args.device == 'npu' and not torch.npu.is_available():
+        print("警告：npu不可用，自动切换到CPU（计算速度会很慢！）")
+        args.device = 'cpu'
+    
+    # 1. 获取图像路径并验证
+    gen_paths = get_image_paths(args.gen_folder)
+    target_paths = get_image_paths(args.target_folder)
+    
+    print(f"=== 数据统计 ===")
+    print(f"生成结果图像数量: {len(gen_paths)}")
+    print(f"目标图像数量: {len(target_paths)}")
+    
+    # 确保两张图像数量一致
+    min_num = min(len(gen_paths), len(target_paths))
+    if len(gen_paths) != len(target_paths):
+        print(f"警告：生成结果和目标图像数量不一致，将使用前{min_num}张图像计算指标")
+        gen_paths = gen_paths[:min_num]
+        target_paths = target_paths[:min_num]
+    
+    # 2. 计算指标
+    mean_lpips, std_lpips, lpips_scores = calculate_lpips(gen_paths, target_paths, device=args.device)
+    fid_value = calculate_fid(args.gen_folder, args.target_folder, device=args.device, batch_size=args.batch_size)
+    
+    # 3. 保存结果（可选）
+    if args.save_scores:
+        save_dir = "./metric_results"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 保存LPIPS单张分数
+        with open(os.path.join(save_dir, "lpips_scores.txt"), 'w') as f:
+            f.write("图像序号\t生成路径\t目标路径\tLPIPS分数\n")
+            for i, (gen_path, target_path, score) in enumerate(zip(gen_paths, target_paths, lpips_scores)):
+                f.write(f"{i+1}\t{gen_path}\t{target_path}\t{score:.4f}\n")
+        
+        # 保存汇总结果
+        with open(os.path.join(save_dir, "metric_summary.txt"), 'w') as f:
+            f.write("=== 评估指标汇总 ===\n")
+            f.write(f"生成文件夹: {args.gen_folder}\n")
+            f.write(f"目标文件夹: {args.target_folder}\n")
+            f.write(f"评估图像数量: {len(gen_paths)}\n")
+            f.write(f"\nLPIPS - 平均值: {mean_lpips:.4f}, 标准差: {std_lpips:.4f}\n")
+            f.write(f"FID - 数值: {fid_value:.4f}\n")
+            f.write(f"\n指标说明:\n")
+            f.write(f"1. LPIPS: 感知相似度，值越小越优（理想≈0，最大≈1）\n")
+            f.write(f"2. FID: 分布相似度，值越小越优（理想≈0，一般<100为优秀）\n")
+        
+        print(f"\n指标结果已保存到: {save_dir}")
+    
+    # 4. 打印最终汇总
+    print(f"\n=== 最终评估结果 ===")
+    print(f"评估图像数量: {len(gen_paths)}")
+    print(f"LPIPS: {mean_lpips:.4f} ± {std_lpips:.4f}")
+    print(f"FID: {fid_value:.4f}")
+    print(f"\n指标说明:")
+    print(f"- LPIPS（感知相似度）: 衡量图像的感知质量，值越小表示生成图像与目标越相似（基于人类视觉感知）")
+    print(f"- FID（分布相似度）: 衡量生成分布与真实分布的差异，值越小表示生成结果的分布越接近真实数据")
 
 if __name__ == "__main__":
-    # 创建保存目录
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    os.makedirs(GENERATED_ROOT, exist_ok=True)
-    os.makedirs(TARGET_ROOT, exist_ok=True)
-
-    # 加载测试数据集（仅前MAX_SAMPLES个样本）
-    full_dataset = MultiScaleDataset(TEST_DATA_ROOT, TEMPLATE_SIZE, TARGET_SIZE)
-    sample_count = min(MAX_SAMPLES, len(full_dataset))
-    test_dataset = Subset(full_dataset, range(sample_count))
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True if DEVICE == 'npu' else False
-    )
-    print(f"测试集规模: {len(test_dataset)} 样本（仅使用前{sample_count}个）")
-    print(f"使用设备: {DEVICE}")
-
-    # 初始化模型和扩散器
-    model = MultiScaleUNet(TARGET_SIZE).to(DEVICE)
-    diffusion = SimpleDiffusion(device=DEVICE)
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    model.load_state_dict(checkpoint)
-    model.eval()
-    print(f"已加载模型权重: {CHECKPOINT_PATH}")
-
-    # 初始化LPIPS
-    lpips_calculator = LPIPS(net='alex').to(DEVICE)
-    lpips_calculator.eval()
-    total_lpips = 0.0
-    total_batches = 0
-
-    # 生成并保存图像（不分组，直接保存到根目录）
-    with torch.no_grad():
-        for batch_idx, (cond, target) in enumerate(tqdm.tqdm(test_loader, desc="生成与保存")):
-            cond = cond.to(DEVICE, dtype=torch.float32)  # [B, 1, 128, 128]
-            target = target.to(DEVICE, dtype=torch.float32)  # [B, 1, 32, 32]
-
-            # 生成图像
-            sampled = diffusion.sample(
-                model,
-                cond,
-                shape=(cond.size(0), 1, TARGET_SIZE, TARGET_SIZE),
-                steps=DIFFUSION_STEPS
-            )
-
-            # 保存生成图像和真实图像（不分组）
-            save_images(sampled, GENERATED_ROOT, batch_idx)
-            save_images(target, TARGET_ROOT, batch_idx)
-
-            # 计算LPIPS（需转为3通道输入）
-            sampled_rgb = sampled.repeat(1, 3, 1, 1)  # [B, 3, H, W]
-            target_rgb = target.repeat(1, 3, 1, 1)
-            lpips_score = lpips_calculator(sampled_rgb, target_rgb).mean().item()
-            total_lpips += lpips_score
-            total_batches += 1
-
-        # 计算全局FID
-        print("\n开始计算全局FID...")
-        try:
-            # 统计有效图像数量
-            gen_files = [f for f in os.listdir(GENERATED_ROOT) if f.endswith(('.png', '.jpg', '.jpeg'))]
-            tgt_files = [f for f in os.listdir(TARGET_ROOT) if f.endswith(('.png', '.jpg', '.jpeg'))]
-            if len(gen_files) == 0 or len(tgt_files) == 0:
-                raise ValueError("生成图像或真实图像目录为空")
-
-            # 计算FID
-            global_batch_size = min(BATCH_SIZE, len(gen_files), len(tgt_files), 50)  # 控制批次大小
-            global_fid = fid_score.calculate_fid_given_paths(
-                paths=[GENERATED_ROOT, TARGET_ROOT],
-                batch_size=global_batch_size,
-                device=DEVICE,
-                dims=2048,
-                num_workers=4
-            )
-        except Exception as e:
-            print(f"全局FID计算失败: {e}")
-            global_fid = -1
-
-    # 保存结果
-    result_path = os.path.join(SAVE_DIR, "evaluation_results.txt")
-    with open(result_path, "w") as f:
-        f.write(f"评估时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"模型路径: {CHECKPOINT_PATH}\n")
-        f.write(f"测试样本数: {len(test_dataset)}\n")
-        f.write(f"全局FID: {global_fid:.4f}\n")
-        f.write(f"平均LPIPS: {total_lpips/total_batches:.4f}\n")
-
-    # 打印结果
-    print("\n===== 评估结果 =====")
-    print(f"全局FID: {global_fid:.4f}")
-    print(f"平均LPIPS: {total_lpips/total_batches:.4f}")
-    print(f"结果已保存至: {result_path}")
+    main()

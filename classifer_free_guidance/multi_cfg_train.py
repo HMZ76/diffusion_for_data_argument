@@ -13,6 +13,8 @@ import torch.distributed as dist
 import torch_npu
 from torch.nn.parallel import DistributedDataParallel as DDP
 import argparse
+from torch.utils.tensorboard import SummaryWriter  # 导入TensorBoard
+from datetime import datetime  # 用于生成时间戳
 
 # 设置随机种子和默认数据类型
 def set_seed(seed=42):
@@ -137,9 +139,10 @@ class MultiScaleDataset(Dataset):
         assert len(input_files) > 0, f"未找到数据文件"
         
         self.data_pairs = list(zip(input_files, target_files))
-        print(f"加载了 {len(self.data_pairs)} 个数据对")
-        print(f"条件图像尺寸: {template_size}x{template_size}")
-        print(f"目标图像尺寸: {target_size}x{target_size}")
+        if dist.get_rank() == 0:  # 仅主进程打印数据集信息
+            print(f"加载了 {len(self.data_pairs)} 个数据对")
+            print(f"条件图像尺寸: {template_size}x{template_size}")
+            print(f"目标图像尺寸: {target_size}x{target_size}")
 
     def __len__(self):
         return len(self.data_pairs)
@@ -168,7 +171,8 @@ class MultiScaleDataset(Dataset):
             return condition_tensor, target_tensor
             
         except Exception as e:
-            print(f"加载数据出错 {input_path}: {e}")
+            if dist.get_rank() == 0:
+                print(f"加载数据出错 {input_path}: {e}")
             return (torch.zeros(1, self.template_size, self.template_size), 
                    torch.zeros(1, self.target_size, self.target_size))
 
@@ -418,12 +422,19 @@ def main():
     )
     local_rank = args.local_rank
     torch.npu.set_device(local_rank)  # 设置当前进程使用的设备
-    is_main_process = (local_rank == 0)  # 主进程（仅主进程保存模型/样本）
+    is_main_process = (local_rank == 0)  # 主进程（仅主进程保存模型/样本/TensorBoard）
     
     if is_main_process:
         print(f"使用设备: {device}，总卡数: {dist.get_world_size()}")
         print(f"多尺度训练：条件{template_size}x{template_size} -> 目标{target_size}x{target_size}")
         print(f"单卡batch_size: {batch_size}，总batch_size: {batch_size * dist.get_world_size()}")
+        
+        # ========== TensorBoard 配置（仅主进程初始化） ==========
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = f"./tensorboard_logs/run_{timestamp}_worldsize_{dist.get_world_size()}"
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"TensorBoard日志保存路径: {log_dir}")
+        # ======================================================
     
     # 数据加载（使用DistributedSampler分片数据）
     dataset = MultiScaleDataset(data_root, target_size, template_size)
@@ -443,16 +454,29 @@ def main():
     # 优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # 仅主进程创建保存目录
+    # 仅主进程创建保存目录和记录模型图
     if is_main_process:
         os.makedirs("./checkpoints", exist_ok=True)
         os.makedirs("./samples", exist_ok=True)
         print(f"模型参数量: {sum(p.numel() for p in model.module.parameters()):,}")  # 注意用model.module访问原模型
+        
+        # ========== 记录模型图（可选，仅主进程） ==========
+        try:
+            # 创建虚拟输入用于绘制模型图
+            dummy_x = torch.randn(1, 1, target_size, target_size).to(local_rank)
+            dummy_t = torch.tensor([0]).to(local_rank)
+            dummy_cond = torch.randn(1, 1, template_size, template_size).to(local_rank)
+            writer.add_graph(model.module, (dummy_x, dummy_t, dummy_cond))  # 使用model.module
+            print("模型图已保存到TensorBoard")
+        except Exception as e:
+            print(f"保存模型图失败: {e}")
+        # ==============================================
     
     # 扩散器
     diffusion = SimpleDiffusion(device=local_rank)
     
     # 训练循环
+    global_step = 0  # 全局步数，用于TensorBoard记录
     for epoch in range(epochs):
         sampler.set_epoch(epoch)  # 确保每个epoch数据打乱方式不同
         model.train()
@@ -476,9 +500,14 @@ def main():
                 
                 total_loss += loss.item()
                 
-                # 仅主进程打印日志
+                # 仅主进程打印日志和记录步骤损失
                 if is_main_process and step % 50 == 0:
                     print(f"Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}")
+                    # ========== 记录步骤损失 ==========
+                    writer.add_scalar('Train/Loss_Step', loss.item(), global_step)
+                    writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                    global_step += 1
+                    # ==================================
                     
             except Exception as e:
                 if is_main_process:
@@ -492,12 +521,15 @@ def main():
         
         if is_main_process and len(dataloader) > 0:
             print(f"Epoch {epoch} 完成, 平均损失: {avg_loss:.4f}")
+            # ========== 记录Epoch平均损失 ==========
+            writer.add_scalar('Train/Avg_Loss_Epoch', avg_loss, epoch)
+            # ======================================
         
         # 仅主进程保存模型
         if is_main_process and epoch % 2 == 0:
             torch.save(model.module.state_dict(), f"./checkpoints/multiscale_model_epoch_{epoch}.pt")
         
-        # 仅主进程生成样本
+        # 仅主进程生成样本并记录到TensorBoard
         if is_main_process and epoch % 2 == 0:
             try:
                 model.eval()
@@ -540,12 +572,42 @@ def main():
                     except Exception as grid_error:
                         print(f"跳过网格创建: {grid_error}")
                 
-                print(f"对比样本已保存到 ./samples/")
+                # ========== 记录图像到TensorBoard（仅主进程） ==========
+                # 归一化图像到[0,1]范围用于TensorBoard显示
+                cond_imgs = denormalize_img(cond_batch) / 255.0  # (4,1,128,128)
+                target_imgs = denormalize_img(target_batch) / 255.0  # (4,1,32,32)
+                gen_imgs = denormalize_img(samples) / 255.0  # (4,1,32,32)
+                
+                # 记录输入图像（128x128）
+                writer.add_images('Images/Input_128x128', cond_imgs, epoch, dataformats='NCHW')
+                
+                # 记录目标图像（32x32）
+                writer.add_images('Images/Target_32x32', target_imgs, epoch, dataformats='NCHW')
+                
+                # 记录生成图像（32x32）
+                writer.add_images('Images/Generated_32x32', gen_imgs, epoch, dataformats='NCHW')
+                
+                # 创建对比网格并记录
+                # 将32x32的目标和生成图上采样到128x128以便对比
+                target_imgs_upscaled = F.interpolate(target_imgs, size=(128, 128), mode='nearest')
+                gen_imgs_upscaled = F.interpolate(gen_imgs, size=(128, 128), mode='nearest')
+                
+                # 拼接成 [Input, Target, Generated] 的格式
+                comparison_grid = torch.cat([cond_imgs, target_imgs_upscaled, gen_imgs_upscaled], dim=3)  # (4,1,128, 384)
+                writer.add_images('Images/Comparison_Grid', comparison_grid, epoch, dataformats='NCHW')
+                # ======================================================
+                
+                print(f"对比样本已保存到 ./samples/ 和 TensorBoard")
             except Exception as e:
                 print(f"采样出错: {e}")
     
+    # ========== 关闭TensorBoard写入器（仅主进程） ==========
     if is_main_process:
+        writer.close()
+        print(f"TensorBoard日志已保存完成，可通过命令查看: tensorboard --logdir=./tensorboard_logs")
         print("训练完成!")
+    # ======================================================
+    
     dist.destroy_process_group()  # 销毁分布式环境
 
 if __name__ == "__main__":
