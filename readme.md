@@ -32,7 +32,9 @@ mv *.pkl ./data
 python preprocess_data.py
 ```
 
-### classifer_free_guidance训练
+### classifer_free_guidance
+
+##### 训练
 ``` 
 ##单卡训练
 
@@ -48,7 +50,7 @@ python -m torch.distributed.launch --nproc_per_node=8 multi_cfg_train.py
 
 ```
 
-## 采样
+##### 采样
 ```
 python sample.py \
   --model_path ./checkpoints/multiscale_model_epoch_2.pt \
@@ -60,13 +62,17 @@ python sample.py \
 
 ```
 
-### dps训练
+### Diffusion Posterior Sampling
+
+##### 训练
 ```
 cd dps
 #训练
 python score_matching_train.py
+```
 
-#采样
+##### 采样
+```
 python sample.py \
   --model_path ./checkpoints_ddpm_score/best_model.pt \
   --num_samples 20 \
@@ -74,6 +80,7 @@ python sample.py \
   --output_dir ./results \
   --device npu
 ```
+
 
 ### eval(FID似乎有问题)
 ```
