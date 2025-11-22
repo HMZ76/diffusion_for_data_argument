@@ -1,11 +1,15 @@
 ## 使用说明
 
-### 写在开头~配环境啦
+### 配环境
+conda create -n tpdf python=3.10
+
 pip install -r requirements.txt
 
-使用cuda的同学请ctrl+F检索替换npu为cuda并删去import torch_npu
+因为我是用npu训练的
 
-多卡训练通信的"hccl"换为"nccl"
+所以使用gpu的同学请ctrl+F检索把npu替换为cuda并删去import torch_npu
+
+classifer_free_guidance/multi_cfg_train.py多卡训练通信的"hccl"换为"nccl"
 
 ### 下载数据集 
 ```
