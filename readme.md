@@ -82,11 +82,12 @@ python sample.py \
 ```
 
 
-### eval(FID似乎有问题)
+### eval(FID似乎有点大？)
 ```
 python eval.py --gen_folder 生成图片文件夹 --target_folder 目标文件夹
 
 #LPIPS: 0.1196 ± 0.0236
-#FID: 104.7085
+#frechet_inception_distance: 59.43193112401434, 
+
 ```
 
