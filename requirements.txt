@@ -1,0 +1,15 @@
+imutils==0.5.4
+ipython==8.4.0
+matplotlib==3.5.2
+numpy==1.23.1
+opencv_python==4.6.0.66
+opencv-python-headless
+pandas==1.4.3       
+tqdm==4.64.0
+wget==3.2
+torch==2.5
+tensorboard
+torchvision==0.20
+lpips
+pytorch_fid 
+pyyaml
